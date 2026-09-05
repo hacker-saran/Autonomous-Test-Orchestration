@@ -20,15 +20,17 @@ Auth contract (coordinated with Executor — see its module docstring):
     (which must start logged out to actually test login), so every other
     generated test starts pre-authenticated instead of re-running login.
 
-If every heuristic locator strategy fails for a step, `_suggest_better_description`
-re-prompts an LLM with a snapshot of what's actually on the live page (input
-labels/placeholders, button/link text) and retries with its suggestion before
-giving up — this is also the capability Healer's auto-repair reuses to
-re-resolve a specific failing step (see agents/healer.py).
+If every heuristic locator strategy fails for a step, `_find_locator_with_feedback`
+re-prompts an LLM with a *structural* snapshot of the live page (input
+type/name/id/label, position among same-type fields, button/link text —
+deliberately no placeholder/example text, which can collide across fields;
+see the note above `_REPAIR_SYSTEM_PROMPT`) and retries with a structural
+match before giving up — this is also the capability Healer's auto-repair
+reuses to re-resolve a specific failing step (see agents/healer.py).
 
 TODO (team, live at the event):
-  - Locator strategies below are a fixed heuristic list (label -> placeholder
-    -> role -> text). Consider ranking by confidence instead of first-match.
+  - Locator strategies below are a fixed heuristic list (label -> role ->
+    text -> input-type). Consider ranking by confidence instead of first-match.
   - One fresh browser per flow is simple/isolated but adds latency; consider
     reusing a single browser across a `generate()` batch if that matters.
 """
@@ -57,7 +59,7 @@ _PLACEHOLDER_ENV_VARS = {
 }
 
 _LOCATOR_STRATEGIES_BY_ACTION: dict[str, list[str]] = {
-    "fill": ["label", "placeholder", "role_textbox", "input_type_heuristic"],
+    "fill": ["label", "role_textbox", "input_type_heuristic"],
     "select": ["label", "role_combobox"],
     "click": ["role_button", "role_link", "text"],
     "assert_visible": ["text", "label", "role_button", "role_link"],
@@ -302,12 +304,20 @@ def _find_locator(page: Page, step: FlowStep) -> tuple[Locator | None, str | Non
 
 _ELEMENT_SNAPSHOT_JS = """
 () => {
-  const inputs = Array.from(document.querySelectorAll('input, textarea, select')).map((el) => ({
-    type: el.getAttribute('type') || el.tagName.toLowerCase(),
-    placeholder: el.getAttribute('placeholder'),
-    label: (el.labels && el.labels[0] && el.labels[0].innerText) || null,
-    aria_label: el.getAttribute('aria-label'),
-  }));
+  const typeCounts = {};
+  const inputs = Array.from(document.querySelectorAll('input, textarea, select')).map((el) => {
+    const type = el.getAttribute('type') || el.tagName.toLowerCase();
+    const index_of_type = typeCounts[type] || 0;
+    typeCounts[type] = index_of_type + 1;
+    return {
+      type,
+      index_of_type,
+      name: el.getAttribute('name'),
+      id: el.getAttribute('id'),
+      label: (el.labels && el.labels[0] && el.labels[0].innerText) || null,
+      aria_label: el.getAttribute('aria-label'),
+    };
+  });
   const clickable = Array.from(document.querySelectorAll('button, [role="button"], a'))
     .map((el) => (el.innerText || el.getAttribute('aria-label') || '').trim())
     .filter(Boolean);
@@ -315,14 +325,30 @@ _ELEMENT_SNAPSHOT_JS = """
 }
 """
 
+# Deliberately excludes placeholder text from the snapshot and the prompt: an
+# example value like "John" can be a substring of another field's placeholder
+# ("johnsmith"), causing a false ambiguous match — a real bug found in
+# testing. Fields are identified structurally instead: type, name/id
+# attributes, and position among same-type fields (index_of_type), which is
+# unambiguous by construction.
 _REPAIR_SYSTEM_PROMPT = """A test step's target_description did not resolve to
-exactly one live element using label/placeholder/role/text matching. You are
-given the step and a snapshot of what's actually on the page right now.
-Suggest a short `suggested_description` that is more likely to match the
-ACTUAL label/placeholder/visible text of the single element this step should
-target — ground it in the snapshot, never invent an element that isn't
-there. If genuinely nothing in the snapshot plausibly matches, say so in
-`rationale` and repeat the original description unchanged.
+exactly one live element via label/role/text matching. You are given the
+step and a structural snapshot of the inputs actually on the page right now
+— note there is no placeholder text in the snapshot; example/hint text is
+not a reliable identifier since one field's example value can be a substring
+of another's, causing incorrect matches. Identify the single element this
+step should target using only:
+  - "name": the input's `name` attribute, if it has one and it's specific.
+  - "id": the input's `id` attribute, if it has one and it's specific.
+  - "nth_of_type": when there's no usable name/id, use the input's `type`
+    and its `index_of_type` from the snapshot (0-based position among
+    elements of that same type) — set `value` to "<type>:<index_of_type>",
+    e.g. "text:0" for the first plain text input, "password:1" for the
+    second password input. Use the step's own wording (e.g. "First"/
+    "Second"/"Third", "Confirm password") together with each field's order,
+    label, and aria_label in the snapshot to infer which index is meant.
+Ground this only in the snapshot given — never invent a name/id/index that
+isn't there.
 """
 
 
@@ -335,7 +361,7 @@ def _find_locator_with_feedback(page: Page, step: FlowStep) -> tuple[Locator | N
     user_prompt = (
         f"action: {step.action}\n"
         f"original target_description: {step.target_description!r}\n"
-        f"live page snapshot:\n{json.dumps(snapshot, indent=2)[:4000]}"
+        f"live page structural snapshot:\n{json.dumps(snapshot, indent=2)[:4000]}"
     )
     try:
         suggestion = call_structured(_REPAIR_SYSTEM_PROMPT, user_prompt, SelectorSuggestion)
@@ -343,15 +369,37 @@ def _find_locator_with_feedback(page: Page, step: FlowStep) -> tuple[Locator | N
         logger.info("Generator: feedback-retry LLM call failed for step %s: %s", step.step_id, exc)
         return None, None
 
-    if suggestion.suggested_description == step.target_description:
+    locator, expr = _build_structural_locator(page, suggestion)
+    if locator is None:
+        return None, None
+    try:
+        if locator.count() != 1:
+            return None, None
+    except PlaywrightError:
         return None, None
 
     logger.info(
-        "Generator: retrying step %s with suggested description %r (%s)",
-        step.step_id, suggestion.suggested_description, suggestion.rationale,
+        "Generator: retrying step %s via structural match %s=%r (%s)",
+        step.step_id, suggestion.match_by, suggestion.value, suggestion.rationale,
     )
-    retry_step = step.model_copy(update={"target_description": suggestion.suggested_description})
-    return _find_locator(page, retry_step)
+    return locator, expr
+
+
+def _build_structural_locator(page: Page, suggestion: SelectorSuggestion) -> tuple[Locator | None, str | None]:
+    if suggestion.match_by == "name":
+        css = f'[name="{suggestion.value}"]'
+        return page.locator(css), f"locator({css!r})"
+    if suggestion.match_by == "id":
+        css = f'[id="{suggestion.value}"]'
+        return page.locator(css), f"locator({css!r})"
+    if suggestion.match_by == "nth_of_type":
+        input_type, _, index_str = suggestion.value.partition(":")
+        if not index_str or not index_str.isdigit():
+            return None, None
+        css = "textarea" if input_type in ("textarea", "select") else f'input[type="{input_type}"]'
+        index = int(index_str)
+        return page.locator(css).nth(index), f"locator({css!r}).nth({index})"
+    return None, None
 
 
 # Real accessible names/labels are usually a single plain word or two ("Username",
@@ -389,8 +437,6 @@ def _build_locator(page: Page, strategy: str, description: str) -> tuple[Locator
     try:
         if strategy == "label":
             return page.get_by_label(description, exact=False), f"get_by_label({description!r})"
-        if strategy == "placeholder":
-            return page.get_by_placeholder(description, exact=False), f"get_by_placeholder({description!r})"
         if strategy == "role_textbox":
             expr = f"get_by_role('textbox', name={description!r})"
             return page.get_by_role("textbox", name=description, exact=False), expr

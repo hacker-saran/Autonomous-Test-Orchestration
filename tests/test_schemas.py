@@ -98,8 +98,9 @@ def test_generated_test_round_trip():
 
 def test_selector_suggestion_round_trip():
     suggestion = SelectorSuggestion(
-        suggested_description="Your handle",
-        rationale="The input's placeholder reads 'Your handle', not 'Username'.",
+        match_by="nth_of_type",
+        value="text:0",
+        rationale="The first plain-text input, by position, matches 'First name'.",
     )
     assert _round_trip(suggestion) == suggestion
 

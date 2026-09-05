@@ -108,10 +108,14 @@ class GeneratedTest(BaseModel):
 
 class SelectorSuggestion(BaseModel):
     """Feedback-retry tool call: given a step whose target_description didn't
-    resolve to exactly one live element, and a snapshot of what's actually on
-    the page, suggest a better description to retry resolution with.
+    resolve to exactly one live element, and a *structural* snapshot of the
+    page (type/name/id/label/position — deliberately no placeholder text,
+    which can collide across fields, e.g. "John" matching both a first-name
+    field and a "johnsmith"-placeholder username field), identify the single
+    element structurally rather than by guessing at its example content.
     """
-    suggested_description: str
+    match_by: Literal["name", "id", "nth_of_type"]
+    value: str  # name/id attribute value, or "<type>:<0-based index>" for nth_of_type (e.g. "password:1")
     rationale: str
 
 
