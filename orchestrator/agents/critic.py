@@ -4,7 +4,7 @@ escalate.
 
 TODO (team, live at the event):
   - Replace the pass-through below with a `call_structured()` call to
-    SARVAM_MODEL_PRIMARY, forcing the `CoverageVerdict` tool schema.
+    LLM_MODEL_PRIMARY, forcing the `CoverageVerdict` tool schema.
   - Score each of the six dimensions (happy_path, auth_session,
     form_validation, error_state, destructive_action, navigation) as
     covered/partial/missing, with a `justifications[dim]` string citing what

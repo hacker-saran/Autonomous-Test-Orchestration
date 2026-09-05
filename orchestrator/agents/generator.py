@@ -13,6 +13,16 @@ TODO (team, live at the event):
   - Replace the placeholder test body below with one that actually performs
     each `FlowStep.action` against its resolved selector and checks
     `expected_outcome`.
+  - Auth contract from the Planner (see agents/planner.py): an `auth_session`
+    flow's login `fill` steps carry the literal placeholders `{{username}}` /
+    `{{password}}` as `FlowStep.value` — never a real secret. At codegen time,
+    substitute those placeholders with real values read directly from the
+    local credentials file (never round-tripped through the LLM). After that
+    flow runs once, persist `context.storage_state(path=...)` and have every
+    *other* generated test load it via pytest-playwright's `storage_state`
+    fixture/CLI option, so they start pre-authenticated instead of re-running
+    login. This split (Generator substitutes+persists, Executor wires the
+    fixture in) should be coordinated with whoever implements Executor.
 """
 from __future__ import annotations
 

@@ -1,9 +1,13 @@
-"""Sarvam AI client wrapper.
+"""LLM client wrapper (defaults to Sarvam AI).
 
-Sarvam's API is OpenAI-compatible, so we use the `openai` SDK pointed at their
-endpoint instead of hand-rolled HTTP. Every agent that needs a structured LLM
-output goes through `call_structured()` below — no agent talks to the Sarvam
-API directly.
+The target provider is OpenAI-compatible, so we use the `openai` SDK pointed
+at its endpoint instead of hand-rolled HTTP. `LLM_BASE_URL`/`LLM_API_KEY`/
+`LLM_MODEL_PRIMARY`/`LLM_MODEL_FALLBACK` default to Sarvam's endpoint and
+models, but are plain config — pointing them at any other OpenAI-compatible
+endpoint (e.g. Claude's or Gemini's compatibility layer, as a temporary
+stand-in while waiting on Sarvam beta access) needs no code change. Every
+agent that needs a structured LLM output goes through `call_structured()`
+below — no agent talks to the provider's API directly.
 
 Every structured output is forced through a single-tool call (never
 prompt-and-hope JSON):
@@ -14,7 +18,7 @@ prompt-and-hope JSON):
   4. On a validation error, the error text is appended to the conversation and
      the call is retried once more (max 2 attempts total against one model).
   5. If the primary model errors or is unavailable, the call is retried
-     against SARVAM_MODEL_FALLBACK.
+     against LLM_MODEL_FALLBACK.
   6. If every attempt fails, a `SchemaValidationError` is raised. Callers
      (the orchestrator) must catch this and record it as an escalation — it
      must never crash the pipeline.
@@ -52,11 +56,21 @@ class SchemaValidationError(Exception):
 
 
 def _client() -> OpenAI:
+    """Sarvam requires an extra `api-subscription-key` header alongside the
+    Authorization header the openai SDK sends by default. Other OpenAI-compatible
+    providers (e.g. swapping LLM_BASE_URL to Anthropic's or Gemini's compat
+    endpoint while waiting on Sarvam beta access) don't need it, so it's only
+    attached when actually talking to Sarvam.
+    """
     settings = get_settings()
+    default_headers = {}
+    if "sarvam.ai" in settings.llm_base_url:
+        default_headers["api-subscription-key"] = settings.llm_api_key
+
     return OpenAI(
-        base_url=settings.sarvam_base_url,
-        api_key=settings.sarvam_api_key,
-        default_headers={"api-subscription-key": settings.sarvam_api_key},
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        default_headers=default_headers,
     )
 
 
@@ -152,20 +166,21 @@ def call_structured(
     response_model: type[ModelT],
     model: str | None = None,
 ) -> ModelT:
-    """Call Sarvam, forcing a single tool call shaped like `response_model`,
-    validate the result, and return an instance of `response_model`.
+    """Call the configured LLM provider, forcing a single tool call shaped like
+    `response_model`, validate the result, and return an instance of
+    `response_model`.
 
-    Tries `model` (or SARVAM_MODEL_PRIMARY if unset) first; if that model
-    errors or is unavailable, retries against SARVAM_MODEL_FALLBACK. Schema
+    Tries `model` (or LLM_MODEL_PRIMARY if unset) first; if that model
+    errors or is unavailable, retries against LLM_MODEL_FALLBACK. Schema
     validation failures on a given model are retried in-place (see
     `_call_with_validation_retry`) and are NOT treated as a reason to fall
     back to a different model.
     """
     settings = get_settings()
-    primary = model or settings.sarvam_model_primary
+    primary = model or settings.llm_model_primary
     models_to_try = [primary]
-    if settings.sarvam_model_fallback != primary:
-        models_to_try.append(settings.sarvam_model_fallback)
+    if settings.llm_model_fallback != primary:
+        models_to_try.append(settings.llm_model_fallback)
 
     tool = _build_tool(response_model)
     tool_name = _tool_name_for(response_model)

@@ -15,7 +15,8 @@ flow between agents.
 ## Setup
 
 One-line description: Python version, installing dependencies, `playwright install`, and
-configuring `.env` from `.env.example` (Sarvam API key, model names, crawl limits).
+configuring `.env` from `.env.example` (LLM provider API key/base URL — Sarvam by
+default, model names, crawl limits).
 
 ## Running the pipeline
 

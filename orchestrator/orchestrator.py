@@ -64,7 +64,9 @@ class TestOrchestrator:
         if site_model.partial:
             escalations.append(f"Crawl returned partial results: {'; '.join(site_model.notes)}")
 
-        plan, verdict = self._plan_and_critique(site_model, prd_text, focus_hint, escalations)
+        plan, verdict = self._plan_and_critique(
+            site_model, prd_text, focus_hint, credentials is not None, escalations
+        )
 
         logger.info("PHASE=GENERATING flow_count=%d", len(plan.flows))
         generated_tests = self._generate(plan, escalations)
@@ -89,6 +91,7 @@ class TestOrchestrator:
         site_model,
         prd_text: str | None,
         focus_hint: str | None,
+        has_credentials: bool,
         escalations: list[str],
     ) -> tuple[TestPlan, CoverageVerdict | None]:
         iteration = 0
@@ -99,7 +102,10 @@ class TestOrchestrator:
         while True:
             logger.info("PHASE=PLANNING iteration=%d", iteration)
             try:
-                plan = self.planner.plan(site_model, prd_text, focus_hint, feedback=feedback, iteration=iteration)
+                plan = self.planner.plan(
+                    site_model, prd_text, focus_hint,
+                    feedback=feedback, iteration=iteration, has_credentials=has_credentials,
+                )
             except SchemaValidationError as exc:
                 logger.error("Planner escalation: %s", exc)
                 escalations.append(f"Planner failed to produce a valid plan: {exc}")
