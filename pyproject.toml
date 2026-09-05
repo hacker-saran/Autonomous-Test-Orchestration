@@ -10,6 +10,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "pytest>=8.0",
     "pytest-playwright>=0.5",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]

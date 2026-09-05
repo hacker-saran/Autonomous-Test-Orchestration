@@ -30,6 +30,7 @@ class Settings:
     crawl_max_pages: int
     crawl_timeout_s: int
     max_replan_iterations: int
+    cors_allowed_origins: list[str]
 
 
 @lru_cache
@@ -43,4 +44,9 @@ def get_settings() -> Settings:
         crawl_max_pages=int(os.environ.get("CRAWL_MAX_PAGES", "20")),
         crawl_timeout_s=int(os.environ.get("CRAWL_TIMEOUT_S", "90")),
         max_replan_iterations=int(os.environ.get("MAX_REPLAN_ITERATIONS", "2")),
+        cors_allowed_origins=[
+            origin.strip()
+            for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+            if origin.strip()
+        ],
     )

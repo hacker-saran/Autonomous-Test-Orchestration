@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-purple: #635bff;
+  --color-purple-bg: #f0eefe;
+  --color-green: #0a7c42;
+  --color-green-bg: #e3f8ec;
+  --color-red: #c23348;
+  --color-red-bg: #fce8ec;
+  --color-amber: #92590b;
+  --color-amber-bg: #fdf1dc;
+}
+
+body {
+  margin: 0;
+  background: #f6f8fa;
+  color: #1a1f36;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
