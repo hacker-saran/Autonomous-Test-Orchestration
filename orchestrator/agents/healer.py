@@ -82,6 +82,7 @@ class Healer:
         generated_test: GeneratedTest | None,
         flow: Flow | None = None,
         credentials: dict | None = None,
+        start_url: str | None = None,
     ) -> HealerVerdict | None:
         if execution_result.status == "pass":
             return None
@@ -116,7 +117,7 @@ class Healer:
         repair_diff = None
 
         if verdict.classification == "script_issue" and flow is not None:
-            repair = self._attempt_repair(flow, credentials)
+            repair = self._attempt_repair(flow, credentials, start_url)
             if repair is not None:
                 action_taken = "auto_repaired"
                 repair_diff = repair
@@ -148,7 +149,7 @@ class Healer:
             return None
         return results[0] if results else None
 
-    def _attempt_repair(self, flow: Flow, credentials: dict | None) -> str | None:
+    def _attempt_repair(self, flow: Flow, credentials: dict | None, start_url: str | None = None) -> str | None:
         """Regenerates the flow (benefiting from Generator's LLM-feedback
         retry, which may resolve steps the original pass missed) and reruns
         once. Returns a unified diff only if the rerun actually passes —
@@ -158,7 +159,7 @@ class Healer:
         old_content = file_path.read_text(encoding="utf-8") if file_path.exists() else ""
 
         try:
-            new_gt = self._generator.generate(flow, credentials=credentials)
+            new_gt = self._generator.generate(flow, credentials=credentials, start_url=start_url)
         except Exception as exc:  # noqa: BLE001 - a failed repair attempt is not a crash
             logger.warning("Healer: repair regeneration failed for flow %s: %s", flow.flow_id, exc)
             return None

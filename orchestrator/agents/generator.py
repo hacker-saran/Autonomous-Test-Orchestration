@@ -133,13 +133,13 @@ def _orch_capture_diagnostics(page):
 
 
 class Generator:
-    def generate(self, flow: Flow, credentials: dict | None = None) -> GeneratedTest:
+    def generate(self, flow: Flow, credentials: dict | None = None, start_url: str | None = None) -> GeneratedTest:
         GENERATED_TESTS_DIR.mkdir(parents=True, exist_ok=True)
         _ensure_conftest()
         file_path = GENERATED_TESTS_DIR / f"test_{flow.flow_id}.py"
 
         try:
-            resolved_lines, selector_map, all_resolved = self._resolve_live(flow, credentials)
+            resolved_lines, selector_map, all_resolved = self._resolve_live(flow, credentials, start_url)
         except Exception as exc:  # noqa: BLE001 - live resolution must never crash the pipeline
             logger.warning(
                 "Generator: live resolution errored for flow %s (%s); falling back to a smoke test",
@@ -162,7 +162,7 @@ class Generator:
         )
 
     def _resolve_live(
-        self, flow: Flow, credentials: dict | None
+        self, flow: Flow, credentials: dict | None, start_url: str | None = None
     ) -> tuple[list[str], dict[str, str], bool]:
         is_auth_flow = flow.category == "auth_session"
         is_destructive_flow = flow.category == "destructive_action"
@@ -178,6 +178,16 @@ class Generator:
             context = browser.new_context(storage_state=storage_state) if storage_state else browser.new_context()
             page = context.new_page()
 
+            # A new page starts at about:blank. If the flow's own first step
+            # isn't already a navigate (the Planner is told not to emit a
+            # redundant one when the target is already start_url), nothing
+            # would otherwise ever load the app — every subsequent locator
+            # lookup would silently fail against a blank page.
+            first_step_navigates = bool(flow.steps) and flow.steps[0].action == "navigate"
+            if start_url and not first_step_navigates:
+                page.goto(start_url, wait_until="networkidle", timeout=15_000)
+                resolved_lines.append(f"    page.goto({start_url!r})")
+
             for step in flow.steps:
                 if stopped_early:
                     resolved_lines.append(
@@ -192,6 +202,14 @@ class Generator:
                 except (PlaywrightError, PlaywrightTimeoutError) as exc:
                     logger.info("Generator: step %s failed to resolve live: %s", step.step_id, exc)
                     line, selector_expr = None, None
+
+                if line == "SKIP_NOT_FATAL":
+                    resolved_lines.append(
+                        f"    # SKIPPED step {step.step_id}: {step.action} -> "
+                        f"{step.target_description!r} (no usable URL; flow continues on current page)"
+                    )
+                    all_resolved = False
+                    continue
 
                 if line is None:
                     resolved_lines.append(
@@ -236,8 +254,18 @@ class Generator:
         self, page: Page, step: FlowStep, credentials: dict | None, is_destructive_flow: bool
     ) -> tuple[str | None, str | None]:
         if step.action == "navigate":
-            if not step.value:
-                return None, None
+            if not step.value or not step.value.startswith(("http://", "https://", "/")):
+                # A malformed navigate (e.g. the Planner put an element
+                # description in `value` instead of a URL) means "there's no
+                # page to go to" — unlike an unresolvable click/fill target,
+                # the page already loaded is still valid, so this should not
+                # halt the rest of the flow the way other unresolved steps do.
+                logger.info(
+                    "Generator: step %s (navigate) has no usable URL in value=%r; skipping, "
+                    "flow continues resolving against the current page",
+                    step.step_id, step.value,
+                )
+                return "SKIP_NOT_FATAL", None
             page.goto(step.value, wait_until="networkidle", timeout=15_000)
             return f"    page.goto({step.value!r})", None
 

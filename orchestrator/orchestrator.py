@@ -69,14 +69,14 @@ class TestOrchestrator:
         )
 
         logger.info("PHASE=GENERATING flow_count=%d", len(plan.flows))
-        generated_tests = self._generate(plan, credentials, escalations)
+        generated_tests = self._generate(plan, credentials, escalations, site_model.start_url)
 
         logger.info("PHASE=EXECUTING test_count=%d", len(generated_tests))
         execution_results = self.executor.run(generated_tests, plan=plan, credentials=credentials)
 
         logger.info("PHASE=HEALING")
         healer_verdicts, execution_results = self._heal(
-            generated_tests, execution_results, plan, credentials, escalations
+            generated_tests, execution_results, plan, credentials, escalations, site_model.start_url
         )
 
         logger.info("PHASE=REPORTING")
@@ -139,7 +139,7 @@ class TestOrchestrator:
         return plan, verdict
 
     def _generate(
-        self, plan: TestPlan, credentials: dict | None, escalations: list[str]
+        self, plan: TestPlan, credentials: dict | None, escalations: list[str], start_url: str
     ) -> list[GeneratedTest]:
         # auth_session first: it's the only flow that captures storage_state,
         # which every other flow's live resolution then reuses to see
@@ -149,13 +149,13 @@ class TestOrchestrator:
         generated_tests: list[GeneratedTest] = []
         for flow in ordered_flows:
             try:
-                generated_tests.append(self.generator.generate(flow, credentials=credentials))
+                generated_tests.append(self.generator.generate(flow, credentials=credentials, start_url=start_url))
             except SchemaValidationError as exc:
                 logger.error("Generator escalation for flow %s: %s", flow.flow_id, exc)
                 escalations.append(f"Generator failed for flow {flow.flow_id}: {exc}")
         return generated_tests
 
-    def _heal(self, generated_tests, execution_results, plan, credentials, escalations: list[str]):
+    def _heal(self, generated_tests, execution_results, plan, credentials, escalations: list[str], start_url: str):
         gt_by_flow = {gt.flow_id: gt for gt in generated_tests}
         flow_by_id = {flow.flow_id: flow for flow in plan.flows} if plan else {}
         healer_verdicts: list[HealerVerdict] = []
@@ -167,7 +167,7 @@ class TestOrchestrator:
             try:
                 verdict = self.healer.heal(
                     result, gt_by_flow.get(result.flow_id),
-                    flow=flow_by_id.get(result.flow_id), credentials=credentials,
+                    flow=flow_by_id.get(result.flow_id), credentials=credentials, start_url=start_url,
                 )
             except SchemaValidationError as exc:
                 logger.error("Healer escalation for flow %s: %s", result.flow_id, exc)

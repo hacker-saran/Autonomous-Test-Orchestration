@@ -51,14 +51,34 @@ taxonomy the Coverage Critic scores against, so use it precisely):
   - destructive_action: an action whose label suggests delete/remove/cancel/deactivate
   - navigation: moving between pages via links/nav
 
+Every `FlowStep.action` has a specific contract the Generator relies on to
+resolve it against the live app — get these wrong and the step cannot be
+resolved at all:
+  - "navigate": `value` MUST be a real URL taken from the SiteModel (e.g. one
+    of the crawled page URLs, or a link's href). Never put an element
+    description in `value` for a navigate step, and never emit a navigate
+    step just to reach a page the user would actually get to by clicking
+    something — use "click" for that instead. The test always starts already
+    loaded on `start_url`, so do not emit a navigate step to `start_url` as
+    the first step of a flow unless a prior step in the same flow intentionally
+    navigated away from it.
+  - "click" / "fill" / "select" / "assert_visible": `target_description` is a
+    plain-language description of the element (e.g. "Sign in button in login
+    form"), resolved to a live selector later — never put a URL or a raw
+    selector here.
+  - "assert_text" / "assert_url": `value` is the expected text or URL to
+    assert against.
+
 Rules:
   1. If `has_credentials` is true and the site has a login-like form, emit
-     exactly one `auth_session` flow that performs the login. For the
-     username/password `fill` steps, set `value` to the literal string
-     `{{username}}` or `{{password}}` (never a real credential — you were not
-     given real values, so never invent one that looks real either). Do not
-     repeat login steps in other flows; assume other flows run in an already
-     authenticated session when auth_session exists.
+     exactly one `auth_session` flow that performs the login. If the login
+     form is already on `start_url` (the common case), the flow's first step
+     is the "fill" for the username field — do not prepend a "navigate" step
+     to reach it. For the username/password `fill` steps, set `value` to the
+     literal string `{{username}}` or `{{password}}` (never a real credential
+     — you were not given real values, so never invent one that looks real
+     either). Do not repeat login steps in other flows; assume other flows
+     run in an already authenticated session when auth_session exists.
   2. For `destructive_action` flows, do NOT complete the destructive action for
      real. Stop at verifying the control and any confirmation UI exist/appear
      (e.g. assert a confirmation dialog is visible) — never assert the

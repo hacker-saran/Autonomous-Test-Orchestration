@@ -9,26 +9,34 @@ stand-in while waiting on Sarvam beta access) needs no code change. Every
 agent that needs a structured LLM output goes through `call_structured()`
 below — no agent talks to the provider's API directly.
 
-Every structured output is forced through a single-tool call (never
-prompt-and-hope JSON):
-  1. One tool is defined from the target Pydantic model's JSON schema.
-  2. The call forces that tool via `tool_choice`.
-  3. The returned tool-call arguments are parsed as JSON and validated against
-     the Pydantic model.
-  4. On a validation error, the error text is appended to the conversation and
-     the call is retried once more (max 2 attempts total against one model).
-  5. If the primary model errors or is unavailable, the call is retried
+Every structured output is forced through the provider's Structured Outputs
+mode (never prompt-and-hope JSON, and no dependency on tool-calling support):
+  1. The call sets `response_format={"type": "json_schema", "json_schema": {...}}`
+     built from the target Pydantic model's JSON schema (non-strict — see
+     `_build_response_format`).
+  2. The model's reply text (`message.content`) is parsed as JSON and validated
+     against the Pydantic model.
+  3. On a validation error, the reply is appended to the conversation along
+     with the error text, and the call is retried once more (max 2 attempts
+     total against one model).
+  4. If the primary model errors or is unavailable, the call is retried
      against LLM_MODEL_FALLBACK.
-  6. If every attempt fails, a `SchemaValidationError` is raised. Callers
+  5. If every attempt fails, a `SchemaValidationError` is raised. Callers
      (the orchestrator) must catch this and record it as an escalation — it
      must never crash the pipeline.
+
+We deliberately avoid tool calling here: some OpenAI-compatible providers
+(e.g. Sarvam) don't reliably honor a forced `tool_choice`, or mis-serialize
+nested objects/arrays inside tool-call arguments. `response_format` json_schema
+mode asks the provider to constrain its own text generation to the schema
+directly, which every provider we've targeted supports more reliably.
 
 Note: reasoning models return chain-of-thought in a separate
 `reasoning_content` field on the message, not `content`. This wrapper never
 reads or surfaces that field. If a rationale is needed downstream (e.g. in the
 final report), it must be an explicit field on the response model
 (e.g. `HealerVerdict.rationale`) that the model fills in as part of its
-structured tool call.
+structured JSON reply.
 """
 from __future__ import annotations
 
@@ -46,6 +54,7 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _MAX_VALIDATION_ATTEMPTS = 2
+_MAX_TOKENS = 16384
 
 
 class SchemaValidationError(Exception):
@@ -74,17 +83,19 @@ def _client() -> OpenAI:
     )
 
 
-def _tool_name_for(response_model: type[BaseModel]) -> str:
-    return f"emit_{response_model.__name__.lower()}"
-
-
-def _build_tool(response_model: type[BaseModel]) -> dict[str, Any]:
+def _build_response_format(response_model: type[BaseModel]) -> dict[str, Any]:
+    """`strict: True` (OpenAI's stricter json_schema variant) additionally
+    requires every property to be listed in `required` and
+    `additionalProperties: false` throughout — Pydantic's `model_json_schema()`
+    doesn't emit that for models with optional/defaulted fields (e.g. `Flow`),
+    so we deliberately omit `strict` and rely on plain (non-strict) json_schema
+    mode instead.
+    """
     return {
-        "type": "function",
-        "function": {
-            "name": _tool_name_for(response_model),
-            "description": f"Emit a validated {response_model.__name__} payload.",
-            "parameters": response_model.model_json_schema(),
+        "type": "json_schema",
+        "json_schema": {
+            "name": response_model.__name__,
+            "schema": response_model.model_json_schema(),
         },
     }
 
@@ -94,9 +105,9 @@ def _call_with_validation_retry(
     model_name: str,
     system_prompt: str,
     user_prompt: str,
-    tool: dict[str, Any],
-    tool_name: str,
+    response_format: dict[str, Any],
     response_model: type[ModelT],
+    extra_body: dict[str, Any],
 ) -> ModelT:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -108,24 +119,43 @@ def _call_with_validation_retry(
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
-            tools=[tool],
-            tool_choice={"type": "function", "function": {"name": tool_name}},
+            response_format=response_format,
+            max_tokens=_MAX_TOKENS,
+            extra_body=extra_body,
         )
         message = response.choices[0].message
-        tool_calls = message.tool_calls or []
+        content = message.content
+        finish_reason = response.choices[0].finish_reason
 
-        if not tool_calls:
-            last_error = "model returned no tool call"
+        if finish_reason == "length":
+            last_error = f"response truncated at max_tokens={_MAX_TOKENS} (finish_reason=length)"
             logger.warning(
                 "call_structured: %s attempt %d/%d on %s: %s",
                 response_model.__name__, attempt, _MAX_VALIDATION_ATTEMPTS, model_name, last_error,
             )
-            messages.append({"role": "user", "content": f"You must call the {tool_name} tool. Retry."})
+            messages.append({"role": "assistant", "content": content or ""})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your reply was cut off before finishing the JSON. Reply again with the "
+                        "complete JSON payload only, more concisely if needed to fit."
+                    ),
+                }
+            )
             continue
 
-        call = tool_calls[0]
+        if not content:
+            last_error = "model returned no content"
+            logger.warning(
+                "call_structured: %s attempt %d/%d on %s: %s",
+                response_model.__name__, attempt, _MAX_VALIDATION_ATTEMPTS, model_name, last_error,
+            )
+            messages.append({"role": "user", "content": "You must reply with the JSON payload. Retry."})
+            continue
+
         try:
-            parsed = json.loads(call.function.arguments)
+            parsed = json.loads(content)
             return response_model.model_validate(parsed)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = str(exc)
@@ -133,24 +163,11 @@ def _call_with_validation_retry(
                 "call_structured: %s attempt %d/%d on %s failed validation: %s",
                 response_model.__name__, attempt, _MAX_VALIDATION_ATTEMPTS, model_name, last_error,
             )
+            messages.append({"role": "assistant", "content": content})
             messages.append(
                 {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": call.id,
-                            "type": "function",
-                            "function": {"name": call.function.name, "arguments": call.function.arguments},
-                        }
-                    ],
-                }
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": f"Validation error, fix your arguments and retry: {exc}",
+                    "role": "user",
+                    "content": f"Validation error, fix your JSON and reply with the corrected payload only: {exc}",
                 }
             )
 
@@ -166,9 +183,9 @@ def call_structured(
     response_model: type[ModelT],
     model: str | None = None,
 ) -> ModelT:
-    """Call the configured LLM provider, forcing a single tool call shaped like
-    `response_model`, validate the result, and return an instance of
-    `response_model`.
+    """Call the configured LLM provider, constraining its reply to the JSON
+    schema of `response_model` via `response_format`, validate the result, and
+    return an instance of `response_model`.
 
     Tries `model` (or LLM_MODEL_PRIMARY if unset) first; if that model
     errors or is unavailable, retries against LLM_MODEL_FALLBACK. Schema
@@ -182,15 +199,22 @@ def call_structured(
     if settings.llm_model_fallback != primary:
         models_to_try.append(settings.llm_model_fallback)
 
-    tool = _build_tool(response_model)
-    tool_name = _tool_name_for(response_model)
+    response_format = _build_response_format(response_model)
     client = _client()
+
+    # Sarvam's reasoning models default to "thinking" mode, which spends
+    # max_tokens on reasoning_content before ever writing to content -- for a
+    # forced structured-extraction call we want the schema-conformant answer,
+    # not chain-of-thought, so thinking is switched off for Sarvam specifically.
+    extra_body: dict[str, Any] = {}
+    if "sarvam.ai" in settings.llm_base_url:
+        extra_body["reasoning_effort"] = None
 
     last_api_error: Exception | None = None
     for model_name in models_to_try:
         try:
             return _call_with_validation_retry(
-                client, model_name, system_prompt, user_prompt, tool, tool_name, response_model
+                client, model_name, system_prompt, user_prompt, response_format, response_model, extra_body
             )
         except SchemaValidationError:
             raise
