@@ -69,20 +69,24 @@ class TestOrchestrator:
         )
 
         logger.info("PHASE=GENERATING flow_count=%d", len(plan.flows))
-        generated_tests = self._generate(plan, escalations)
+        generated_tests = self._generate(plan, credentials, escalations)
 
         logger.info("PHASE=EXECUTING test_count=%d", len(generated_tests))
-        execution_results = self.executor.run(generated_tests)
+        execution_results = self.executor.run(generated_tests, plan=plan, credentials=credentials)
 
         logger.info("PHASE=HEALING")
-        healer_verdicts, execution_results = self._heal(generated_tests, execution_results, escalations)
+        healer_verdicts, execution_results = self._heal(
+            generated_tests, execution_results, plan, credentials, escalations
+        )
 
         logger.info("PHASE=REPORTING")
         report = self._report(plan, execution_results, healer_verdicts, site_model, prd_text, verdict, escalations)
 
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        json_path, md_path = self.reporter.write(report, REPORTS_DIR)
-        logger.info("Report written to %s and %s", json_path, md_path)
+        json_path, md_path, html_path = self.reporter.write(
+            report, REPORTS_DIR, plan=plan, execution_results=execution_results, site_model=site_model
+        )
+        logger.info("Report written to %s, %s, and %s", json_path, md_path, html_path)
 
         return report
 
@@ -134,17 +138,24 @@ class TestOrchestrator:
 
         return plan, verdict
 
-    def _generate(self, plan: TestPlan, escalations: list[str]) -> list[GeneratedTest]:
+    def _generate(
+        self, plan: TestPlan, credentials: dict | None, escalations: list[str]
+    ) -> list[GeneratedTest]:
+        # auth_session first: it's the only flow that captures storage_state,
+        # which every other flow's live resolution then reuses to see
+        # authenticated-only pages/elements.
+        ordered_flows = sorted(plan.flows, key=lambda f: 0 if f.category == "auth_session" else 1)
+
         generated_tests: list[GeneratedTest] = []
-        for flow in plan.flows:
+        for flow in ordered_flows:
             try:
-                generated_tests.append(self.generator.generate(flow))
+                generated_tests.append(self.generator.generate(flow, credentials=credentials))
             except SchemaValidationError as exc:
                 logger.error("Generator escalation for flow %s: %s", flow.flow_id, exc)
                 escalations.append(f"Generator failed for flow {flow.flow_id}: {exc}")
         return generated_tests
 
-    def _heal(self, generated_tests, execution_results, escalations: list[str]):
+    def _heal(self, generated_tests, execution_results, plan, credentials, escalations: list[str]):
         gt_by_flow = {gt.flow_id: gt for gt in generated_tests}
         healer_verdicts: list[HealerVerdict] = []
         results_by_flow = {r.flow_id: r for r in execution_results}
@@ -171,7 +182,7 @@ class TestOrchestrator:
                 gt = gt_by_flow.get(result.flow_id)
                 if gt is not None:
                     logger.info("PHASE=HEALING rerun flow=%s", verdict.flow_id)
-                    rerun = self.executor.run([gt])
+                    rerun = self.executor.run([gt], plan=plan, credentials=credentials)
                     if rerun:
                         results_by_flow[verdict.flow_id] = rerun[0]
 
