@@ -392,11 +392,12 @@ _ELEMENT_SNAPSHOT_JS = """
 # unambiguous by construction.
 _REPAIR_SYSTEM_PROMPT = """A test step's target_description did not resolve to
 exactly one live element via label/role/text matching. You are given the
-step and a structural snapshot of the inputs actually on the page right now
-— note there is no placeholder text in the snapshot; example/hint text is
-not a reliable identifier since one field's example value can be a substring
-of another's, causing incorrect matches. Identify the single element this
-step should target using only:
+step and a structural snapshot of the page right now — its `inputs` (for
+fill/select steps) and its `clickable_text` (for click steps, e.g. buttons
+and links). There is no placeholder text in the snapshot; example/hint text
+is not a reliable identifier since one field's example value can be a
+substring of another's, causing incorrect matches. Identify the single
+element this step should target using only:
   - "name": the input's `name` attribute, if it has one and it's specific.
   - "id": the input's `id` attribute, if it has one and it's specific.
   - "nth_of_type": when there's no usable name/id, use the input's `type`
@@ -406,8 +407,13 @@ step should target using only:
     second password input. Use the step's own wording (e.g. "First"/
     "Second"/"Third", "Confirm password") together with each field's order,
     label, and aria_label in the snapshot to infer which index is meant.
-Ground this only in the snapshot given — never invent a name/id/index that
-isn't there.
+  - "clickable_text": for a click step, only when the step's action is
+    "click" — the exact, verbatim text of one entry from `clickable_text`
+    that this step should click (e.g. "Sign in", "Create an account").
+    Never paraphrase or shorten it; copy it exactly as it appears in the
+    snapshot so it can be matched exactly.
+Ground this only in the snapshot given — never invent a name/id/index/text
+that isn't there.
 """
 
 
@@ -458,6 +464,14 @@ def _build_structural_locator(page: Page, suggestion: SelectorSuggestion) -> tup
         css = "textarea" if input_type in ("textarea", "select") else f'input[type="{input_type}"]'
         index = int(index_str)
         return page.locator(css).nth(index), f"locator({css!r}).nth({index})"
+    if suggestion.match_by == "clickable_text":
+        # Restricted to the same elements _ELEMENT_SNAPSHOT_JS collected
+        # clickable_text from (button, [role="button"], a) — get_by_text
+        # alone could otherwise match a non-interactive element with the
+        # same visible text (e.g. a heading), which count()==1 wouldn't
+        # catch as wrong, just as a different kind of false-positive match.
+        locator = page.locator('button, [role="button"], a').get_by_text(suggestion.value, exact=True)
+        return locator, f"get_by_text({suggestion.value!r}, exact=True)"
     return None, None
 
 
