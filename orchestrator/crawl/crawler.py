@@ -1,6 +1,18 @@
 """SiteCrawler: a working BFS crawler that produces a SiteModel for the
 Planner. This is plumbing, not the "smart" part of the pipeline — no LLM
 calls happen here.
+
+Link discovery has two mechanisms:
+  - `_enqueue_links`: real `<a href>` tags (works for traditional sites).
+  - `_discover_via_clicks`: clicks buttons/nav-like elements and checks
+    whether `page.url` changed. SPA routers (React Router, Vue Router,
+    Angular Router, ...) drive in-app navigation via `history.pushState`
+    under the hood, which updates `page.url` even without a full page
+    reload — so this catches client-side routes that have no crawlable
+    `href` at all. It does not catch a same-URL content swap (e.g. a
+    tab/modal that changes what's shown without changing the URL); that
+    would need tracking "virtual pages" by DOM signature instead of URL,
+    which is a known remaining gap, not attempted here.
 """
 from __future__ import annotations
 
@@ -20,6 +32,15 @@ from orchestrator.schemas import ButtonInfo, FormFieldInfo, FormInfo, LinkInfo, 
 logger = logging.getLogger(__name__)
 
 DESTRUCTIVE_PATTERN = re.compile(r"delete|remove|cancel|deactivate", re.IGNORECASE)
+
+# Broader than DESTRUCTIVE_PATTERN: elements the crawler must never click while
+# exploring, even though they aren't "destructive" from the Planner's point of
+# view. Logout/sign-out would end the authenticated crawl session mid-BFS.
+_UNSAFE_TO_CLICK_PATTERN = re.compile(
+    DESTRUCTIVE_PATTERN.pattern + r"|log[\s-]?out|sign[\s-]?out", re.IGNORECASE
+)
+
+_MAX_CLICK_CANDIDATES_PER_PAGE = 8
 
 # Extracts everything the Planner needs from a single page in one round trip.
 _EXTRACT_JS = """
@@ -138,6 +159,9 @@ class SiteCrawler:
 
                     if depth < max_depth:
                         self._enqueue_links(extracted, current_url, origin, depth, seen_urls, queue)
+                        self._discover_via_clicks(
+                            page, current_url, origin, depth, seen_urls, queue, time_left
+                        )
 
                 if not time_left():
                     notes.append(f"Hit the {timeout_s}s wall-clock timeout before exhausting the crawl frontier.")
@@ -208,6 +232,77 @@ class SiteCrawler:
                 continue
             seen_urls.add(normalized)
             queue.append((absolute, depth + 1))
+
+    @staticmethod
+    def _discover_via_clicks(
+        page: Page,
+        current_url: str,
+        origin: str,
+        depth: int,
+        seen_urls: set[str],
+        queue: deque[tuple[str, int]],
+        time_left,
+    ) -> None:
+        """Clicks a bounded set of buttons/nav-like elements to discover
+        client-side routes that have no real `<a href>` at all. Never clicks
+        anything destructive/logout-like or anything that would submit a
+        form (see _UNSAFE_TO_CLICK_PATTERN and the form-submit check below).
+        Always restores `page` to `current_url` before/after each attempt so
+        one candidate's navigation can't affect the next.
+        """
+        try:
+            candidates = page.locator(
+                'nav button, header button, [role="navigation"] button, '
+                'button, [role="button"], a.btn'
+            )
+            count = candidates.count()
+        except PlaywrightError:
+            return
+
+        tried = 0
+        for i in range(count):
+            if tried >= _MAX_CLICK_CANDIDATES_PER_PAGE or not time_left():
+                break
+
+            element = candidates.nth(i)
+            try:
+                text = (element.inner_text(timeout=1_000) or "").strip()
+            except (PlaywrightError, PlaywrightTimeoutError):
+                continue
+            if not text or _UNSAFE_TO_CLICK_PATTERN.search(text):
+                continue
+
+            try:
+                tag = element.evaluate("el => el.tagName.toLowerCase()")
+                input_type = element.get_attribute("type")
+                inside_form = element.evaluate("el => el.closest('form') !== null")
+            except (PlaywrightError, PlaywrightTimeoutError):
+                continue
+            # A <button> with no explicit type defaults to type="submit" when
+            # inside a <form> — skip anything that could trigger a real submit.
+            if input_type == "submit" or (tag == "button" and input_type is None and inside_form):
+                continue
+
+            tried += 1
+            try:
+                element.click(timeout=3_000)
+                page.wait_for_load_state("networkidle", timeout=5_000)
+            except (PlaywrightError, PlaywrightTimeoutError):
+                pass
+
+            new_url = page.url
+            if urlparse(new_url).netloc == origin:
+                normalized = _normalize_url(new_url)
+                if normalized not in seen_urls:
+                    seen_urls.add(normalized)
+                    queue.append((new_url, depth + 1))
+                    logger.info("Discovered %s via click on %r", new_url, text)
+
+            if _normalize_url(page.url) != _normalize_url(current_url):
+                try:
+                    page.goto(current_url, wait_until="networkidle", timeout=10_000)
+                except (PlaywrightError, PlaywrightTimeoutError):
+                    return  # can't reliably continue trying candidates from here
 
     @staticmethod
     def _login(page: Page, url: str, credentials: dict) -> None:
