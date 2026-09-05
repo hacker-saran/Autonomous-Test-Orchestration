@@ -20,11 +20,13 @@ Auth contract (coordinated with Executor — see its module docstring):
     (which must start logged out to actually test login), so every other
     generated test starts pre-authenticated instead of re-running login.
 
+If every heuristic locator strategy fails for a step, `_suggest_better_description`
+re-prompts an LLM with a snapshot of what's actually on the live page (input
+labels/placeholders, button/link text) and retries with its suggestion before
+giving up — this is also the capability Healer's auto-repair reuses to
+re-resolve a specific failing step (see agents/healer.py).
+
 TODO (team, live at the event):
-  - If a description doesn't resolve to exactly one element, this currently
-    just gives up on that step (and every step after it, since we no longer
-    trust the page state). Consider retrying with feedback — e.g. re-prompt
-    an LLM call with the surrounding DOM/ARIA subtree — before giving up.
   - Locator strategies below are a fixed heuristic list (label -> placeholder
     -> role -> text). Consider ranking by confidence instead of first-match.
   - One fresh browser per flow is simple/isolated but adds latency; consider
@@ -32,6 +34,7 @@ TODO (team, live at the event):
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -39,7 +42,8 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from orchestrator.schemas import Flow, FlowStep, GeneratedTest
+from orchestrator.llm.client import SchemaValidationError, call_structured
+from orchestrator.schemas import Flow, FlowStep, GeneratedTest, SelectorSuggestion
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +245,8 @@ class Generator:
 
         locator, selector_expr = _find_locator(page, step)
         if locator is None:
+            locator, selector_expr = _find_locator_with_feedback(page, step)
+        if locator is None:
             return None, None
 
         if step.action == "click":
@@ -292,6 +298,60 @@ def _find_locator(page: Page, step: FlowStep) -> tuple[Locator | None, str | Non
             if count == 1:
                 return locator, expr
     return None, None
+
+
+_ELEMENT_SNAPSHOT_JS = """
+() => {
+  const inputs = Array.from(document.querySelectorAll('input, textarea, select')).map((el) => ({
+    type: el.getAttribute('type') || el.tagName.toLowerCase(),
+    placeholder: el.getAttribute('placeholder'),
+    label: (el.labels && el.labels[0] && el.labels[0].innerText) || null,
+    aria_label: el.getAttribute('aria-label'),
+  }));
+  const clickable = Array.from(document.querySelectorAll('button, [role="button"], a'))
+    .map((el) => (el.innerText || el.getAttribute('aria-label') || '').trim())
+    .filter(Boolean);
+  return { inputs, clickable_text: clickable };
+}
+"""
+
+_REPAIR_SYSTEM_PROMPT = """A test step's target_description did not resolve to
+exactly one live element using label/placeholder/role/text matching. You are
+given the step and a snapshot of what's actually on the page right now.
+Suggest a short `suggested_description` that is more likely to match the
+ACTUAL label/placeholder/visible text of the single element this step should
+target — ground it in the snapshot, never invent an element that isn't
+there. If genuinely nothing in the snapshot plausibly matches, say so in
+`rationale` and repeat the original description unchanged.
+"""
+
+
+def _find_locator_with_feedback(page: Page, step: FlowStep) -> tuple[Locator | None, str | None]:
+    try:
+        snapshot = page.evaluate(_ELEMENT_SNAPSHOT_JS)
+    except PlaywrightError:
+        return None, None
+
+    user_prompt = (
+        f"action: {step.action}\n"
+        f"original target_description: {step.target_description!r}\n"
+        f"live page snapshot:\n{json.dumps(snapshot, indent=2)[:4000]}"
+    )
+    try:
+        suggestion = call_structured(_REPAIR_SYSTEM_PROMPT, user_prompt, SelectorSuggestion)
+    except SchemaValidationError as exc:
+        logger.info("Generator: feedback-retry LLM call failed for step %s: %s", step.step_id, exc)
+        return None, None
+
+    if suggestion.suggested_description == step.target_description:
+        return None, None
+
+    logger.info(
+        "Generator: retrying step %s with suggested description %r (%s)",
+        step.step_id, suggestion.suggested_description, suggestion.rationale,
+    )
+    retry_step = step.model_copy(update={"target_description": suggestion.suggested_description})
+    return _find_locator(page, retry_step)
 
 
 # Real accessible names/labels are usually a single plain word or two ("Username",

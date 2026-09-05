@@ -1,22 +1,15 @@
 """Reporter agent: joins plan/execution/healer output into a FinalReport and
 writes it to disk (JSON + Markdown summary + an HTML pipeline graph).
 
+`coverage_gaps_remaining` is intentionally left `[]` by `build_report` — the
+orchestrator overwrites it with the last CoverageVerdict.gaps after this
+call, since the critic's verdict isn't itself part of this agent's inputs.
+
 TODO (team, live at the event):
-  - Join everything by `flow_id`: for each planned flow, resolve its final
-    pass/fail status (after any healer-triggered rerun) and roll that up into
-    `flows_by_category` / `pass_count` / `fail_count`.
-  - `untested_flow_risk`: flows the Planner/Critic flagged as important
-    (e.g. high `risk_tag`, or dimensions scored "missing"/"partial" by the
-    Critic) that never got a passing execution — surface these explicitly so
-    a human sees what's still unverified.
-  - `coverage_gaps_remaining`: carry forward the last CoverageVerdict.gaps
-    that were never resolved by a re-plan.
-  - If a PRD was provided, add `prd_gap_analysis`: extract atomic requirement
-    statements from `prd_text` (likely another `call_structured` call) and
-    map each one to a covering flow_id or "not covered".
-  - Consider using `call_structured` for a narrative rollup, but keep the
-    numeric fields on FinalReport computed deterministically from the other
-    agents' output, not invented by an LLM.
+  - `prd_gap_analysis` maps requirements to whichever flow's title/category
+    plausibly covers them — it doesn't check the flow actually *passed*, so
+    a requirement can show "covered" by a flow that failed. Consider cross-
+    referencing execution_results for a sharper signal.
 """
 from __future__ import annotations
 
@@ -26,9 +19,27 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from orchestrator.schemas import ExecutionResult, FinalReport, HealerVerdict, SiteModel, TestPlan
+from orchestrator.llm.client import SchemaValidationError, call_structured
+from orchestrator.schemas import (
+    ExecutionResult, FinalReport, HealerVerdict, PRDGapAnalysis, SiteModel, TestPlan,
+)
 
 logger = logging.getLogger(__name__)
+
+_PRD_SYSTEM_PROMPT = """You are analyzing a Product Requirements Document (PRD)
+against the test flows that were actually planned, to identify coverage gaps.
+
+Extract every atomic, testable requirement statement from the PRD text — one
+requirement per distinct capability or behavior described; split compound
+sentences into separate requirements rather than merging them.
+
+For each requirement, decide whether any of the given planned flows
+plausibly exercises it, based only on that flow's title/category — ground
+every judgment in the flows actually given, never assume coverage that isn't
+evident. If one does, set `covering_flow_id` to that flow's flow_id and
+`status` to "covered". If none does, leave `covering_flow_id` null and set
+`status` to "not_covered".
+"""
 
 _STATUS_COLORS = {
     "pass": "#2ecc71",
@@ -47,9 +58,6 @@ class Reporter:
         site_model: SiteModel,
         prd_text: str | None = None,
     ) -> FinalReport:
-        """Trivial pass-through: deterministic tallies only, no PRD gap
-        analysis and no untested-flow-risk detection yet. See TODO above.
-        """
         flows_by_category: dict[str, int] = {}
         for flow in plan.flows:
             flows_by_category[flow.category] = flows_by_category.get(flow.category, 0) + 1
@@ -62,13 +70,13 @@ class Reporter:
             if v.action_taken == "escalated"
         ]
 
-        prd_gap_analysis = None
-        if prd_text:
-            prd_gap_analysis = [{"note": "stub reporter: PRD gap analysis not implemented yet"}]
+        untested_flow_risk = _compute_untested_flow_risk(plan, execution_results)
+        prd_gap_analysis = _build_prd_gap_analysis(prd_text, plan) if prd_text else None
 
         logger.info(
-            "Reporter: trivial pass-through report, flows_planned=%d pass=%d fail=%d",
-            len(plan.flows), pass_count, fail_count,
+            "Reporter: flows_planned=%d pass=%d fail=%d untested_flow_risk=%d prd_requirements=%s",
+            len(plan.flows), pass_count, fail_count, len(untested_flow_risk),
+            len(prd_gap_analysis) if prd_gap_analysis else 0,
         )
 
         return FinalReport(
@@ -78,7 +86,7 @@ class Reporter:
             fail_count=fail_count,
             healer_actions=healer_verdicts,
             coverage_gaps_remaining=[],
-            untested_flow_risk=[],
+            untested_flow_risk=untested_flow_risk,
             prd_gap_analysis=prd_gap_analysis,
             escalations=escalations,
         )
@@ -224,6 +232,32 @@ def _list_html(items: list[str]) -> str:
     if not items:
         return "<li>none</li>"
     return "".join(f"<li>{html.escape(str(item))}</li>" for item in items)
+
+
+def _compute_untested_flow_risk(plan: TestPlan, execution_results: list[ExecutionResult]) -> list[str]:
+    status_by_flow = {r.flow_id: r.status for r in execution_results}
+    risks = []
+    for flow in plan.flows:
+        status = status_by_flow.get(flow.flow_id)
+        if status is None:
+            risks.append(
+                f"{flow.flow_id} [{flow.category}] {flow.title!r}: no execution result "
+                f"(Generator likely failed for this flow)"
+            )
+        elif status != "pass":
+            risks.append(f"{flow.flow_id} [{flow.category}] {flow.title!r}: did not pass (status={status})")
+    return risks
+
+
+def _build_prd_gap_analysis(prd_text: str, plan: TestPlan) -> list[dict]:
+    flows_desc = "\n".join(f"- {flow.flow_id} [{flow.category}]: {flow.title}" for flow in plan.flows)
+    user_prompt = f"PRD text:\n{prd_text}\n\nPlanned flows:\n{flows_desc}"
+    try:
+        analysis = call_structured(_PRD_SYSTEM_PROMPT, user_prompt, PRDGapAnalysis)
+    except SchemaValidationError as exc:
+        logger.warning("Reporter: PRD gap analysis failed: %s", exc)
+        return [{"error": f"PRD gap analysis failed: {exc}"}]
+    return [r.model_dump() for r in analysis.requirements]
 
 
 def _wrap(text: str, max_len: int) -> str:

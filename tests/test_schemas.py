@@ -18,6 +18,9 @@ from orchestrator.schemas import (
     HealerVerdict,
     LinkInfo,
     PageInfo,
+    PRDGapAnalysis,
+    PRDRequirement,
+    SelectorSuggestion,
     SiteModel,
     TestPlan,
 )
@@ -91,6 +94,24 @@ def test_generated_test_round_trip():
         validation_status="validated",
     )
     assert _round_trip(generated) == generated
+
+
+def test_selector_suggestion_round_trip():
+    suggestion = SelectorSuggestion(
+        suggested_description="Your handle",
+        rationale="The input's placeholder reads 'Your handle', not 'Username'.",
+    )
+    assert _round_trip(suggestion) == suggestion
+
+
+def test_prd_gap_analysis_round_trip():
+    analysis = PRDGapAnalysis(
+        requirements=[
+            PRDRequirement(requirement="Users can log in", covering_flow_id="f0", status="covered"),
+            PRDRequirement(requirement="Users can enable 2FA", covering_flow_id=None, status="not_covered"),
+        ]
+    )
+    assert _round_trip(analysis) == analysis
 
 
 def test_execution_result_round_trip():

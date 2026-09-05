@@ -157,6 +157,7 @@ class TestOrchestrator:
 
     def _heal(self, generated_tests, execution_results, plan, credentials, escalations: list[str]):
         gt_by_flow = {gt.flow_id: gt for gt in generated_tests}
+        flow_by_id = {flow.flow_id: flow for flow in plan.flows} if plan else {}
         healer_verdicts: list[HealerVerdict] = []
         results_by_flow = {r.flow_id: r for r in execution_results}
 
@@ -164,7 +165,10 @@ class TestOrchestrator:
             if result.status == "pass":
                 continue
             try:
-                verdict = self.healer.heal(result, gt_by_flow.get(result.flow_id))
+                verdict = self.healer.heal(
+                    result, gt_by_flow.get(result.flow_id),
+                    flow=flow_by_id.get(result.flow_id), credentials=credentials,
+                )
             except SchemaValidationError as exc:
                 logger.error("Healer escalation for flow %s: %s", result.flow_id, exc)
                 escalations.append(f"Healer failed for flow {result.flow_id}: {exc}")

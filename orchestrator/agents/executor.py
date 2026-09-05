@@ -15,10 +15,13 @@ control everything below without touching the generated file's code:
     requests, and requests still pending when the test ends) as JSON, which
     Executor reads back here into `console_errors`/`network_errors`.
 
+Screenshot capture: `--screenshot=only-on-failure --output=<per-flow dir>`
+are pytest-playwright's own CLI flags (confirmed against the real plugin,
+not guessed) — pytest-playwright sanitizes the test's nodeid into the actual
+filename, so rather than reproduce that algorithm, each flow gets its own
+`--output` directory and Executor just globs it for `test-failed-*.png`.
+
 TODO (team, live at the event):
-  - Run the whole suite in one pytest-playwright invocation (not one
-    subprocess per flow) using `--screenshot=only-on-failure`, and populate
-    `screenshot_path` (still always None below).
   - Parse a machine-readable report (e.g. `pytest --json-report`) instead of
     return-code-only, to get accurate per-test duration/error paths keyed by
     flow_id.
@@ -32,10 +35,12 @@ import subprocess
 import sys
 import time
 
-from orchestrator.agents.generator import DIAGNOSTICS_DIR, STORAGE_STATE_PATH
+from orchestrator.agents.generator import DIAGNOSTICS_DIR, GENERATED_TESTS_DIR, STORAGE_STATE_PATH
 from orchestrator.schemas import ExecutionResult, GeneratedTest, TestPlan
 
 logger = logging.getLogger(__name__)
+
+SCREENSHOTS_DIR = GENERATED_TESTS_DIR / ".artifacts"
 
 
 class Executor:
@@ -47,11 +52,12 @@ class Executor:
     ) -> list[ExecutionResult]:
         """Runs each generated test file as its own `pytest` subprocess and
         maps the return code to pass/fail/error, reading back the
-        console/network diagnostics the conftest.py fixture captured. Still
-        no screenshot capture — see TODO above.
+        console/network diagnostics the conftest.py fixture captured and any
+        on-failure screenshot pytest-playwright produced.
         """
         auth_flow_ids = {f.flow_id for f in plan.flows if f.category == "auth_session"} if plan else set()
         DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
         results: list[ExecutionResult] = []
         for gt in generated_tests:
@@ -66,10 +72,16 @@ class Executor:
             diagnostics_path.unlink(missing_ok=True)  # clear a stale result from a prior run
             env["ORCH_DIAGNOSTICS_PATH"] = str(diagnostics_path)
 
+            screenshot_dir = SCREENSHOTS_DIR / gt.flow_id
+            _clear_dir(screenshot_dir)
+
             start = time.monotonic()
             try:
                 proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", gt.file_path, "-q"],
+                    [
+                        sys.executable, "-m", "pytest", gt.file_path, "-q",
+                        "--screenshot=only-on-failure", f"--output={screenshot_dir}",
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -84,6 +96,7 @@ class Executor:
                 error_message = f"Test timed out: {exc}"
 
             console_errors, network_errors = _read_diagnostics(diagnostics_path)
+            screenshot_path = _find_screenshot(screenshot_dir)
 
             results.append(
                 ExecutionResult(
@@ -91,17 +104,30 @@ class Executor:
                     status=status,
                     duration_ms=duration_ms,
                     error_message=error_message,
-                    screenshot_path=None,
+                    screenshot_path=screenshot_path,
                     console_errors=console_errors,
                     network_errors=network_errors,
                 )
             )
             logger.info(
-                "Executor: flow=%s status=%s duration_ms=%d console_errors=%d network_errors=%d",
-                gt.flow_id, status, duration_ms, len(console_errors), len(network_errors),
+                "Executor: flow=%s status=%s duration_ms=%d console_errors=%d network_errors=%d screenshot=%s",
+                gt.flow_id, status, duration_ms, len(console_errors), len(network_errors), screenshot_path,
             )
 
         return results
+
+
+def _clear_dir(path) -> None:
+    if not path.exists():
+        return
+    for child in path.rglob("*"):
+        if child.is_file():
+            child.unlink(missing_ok=True)
+
+
+def _find_screenshot(screenshot_dir) -> str | None:
+    matches = sorted(screenshot_dir.glob("**/test-failed-*.png"))
+    return str(matches[0]) if matches else None
 
 
 def _read_diagnostics(diagnostics_path) -> tuple[list[str], list[str]]:

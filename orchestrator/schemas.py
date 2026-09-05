@@ -106,6 +106,15 @@ class GeneratedTest(BaseModel):
     validation_status: Literal["validated", "unresolved"]
 
 
+class SelectorSuggestion(BaseModel):
+    """Feedback-retry tool call: given a step whose target_description didn't
+    resolve to exactly one live element, and a snapshot of what's actually on
+    the page, suggest a better description to retry resolution with.
+    """
+    suggested_description: str
+    rationale: str
+
+
 class ExecutionResult(BaseModel):
     flow_id: str
     status: Literal["pass", "fail", "error"]
@@ -129,6 +138,16 @@ class HealerVerdict(BaseModel):
 # --------------------------------------------------------------------------
 # Final report (Reporter)
 # --------------------------------------------------------------------------
+
+
+class PRDRequirement(BaseModel):
+    requirement: str
+    covering_flow_id: str | None = None
+    status: Literal["covered", "not_covered"]
+
+
+class PRDGapAnalysis(BaseModel):
+    requirements: list[PRDRequirement]
 
 
 class FinalReport(BaseModel):
