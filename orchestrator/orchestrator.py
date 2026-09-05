@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from orchestrator import live_events
 from orchestrator.agents.critic import Critic
 from orchestrator.agents.executor import Executor
 from orchestrator.agents.generator import Generator
@@ -53,14 +54,23 @@ class TestOrchestrator:
         escalations: list[str] = []
         prd_text = Path(prd_path).read_text(encoding="utf-8") if prd_path else None
 
+        live_events.reset()
+        live_events.emit("run_started", url=url, has_prd=prd_text is not None, focus_hint=focus_hint)
+
         logger.info("PHASE=EXPLORING url=%s", url)
+        live_events.emit("phase", phase="EXPLORING", url=url)
         site_model = self.crawler.crawl(
             url,
             credentials=credentials,
             max_depth=self.settings.crawl_max_depth,
             max_pages=self.settings.crawl_max_pages,
             timeout_s=self.settings.crawl_timeout_s,
+            on_page=lambda page_info: live_events.emit(
+                "page_crawled", url=page_info.url, title=page_info.title,
+                forms=len(page_info.forms), buttons=len(page_info.buttons), nav_links=len(page_info.nav_links),
+            ),
         )
+        live_events.emit("crawl_done", pages=len(site_model.pages), partial=site_model.partial, notes=site_model.notes)
         if site_model.partial:
             escalations.append(f"Crawl returned partial results: {'; '.join(site_model.notes)}")
 
@@ -69,17 +79,27 @@ class TestOrchestrator:
         )
 
         logger.info("PHASE=GENERATING flow_count=%d", len(plan.flows))
+        live_events.emit("phase", phase="GENERATING", flow_count=len(plan.flows))
         generated_tests = self._generate(plan, credentials, escalations)
 
         logger.info("PHASE=EXECUTING test_count=%d", len(generated_tests))
-        execution_results = self.executor.run(generated_tests, plan=plan, credentials=credentials)
+        live_events.emit("phase", phase="EXECUTING", test_count=len(generated_tests))
+        execution_results = self.executor.run(
+            generated_tests, plan=plan, credentials=credentials,
+            on_result=lambda result: live_events.emit(
+                "test_executed", flow_id=result.flow_id, status=result.status, duration_ms=result.duration_ms,
+                screenshot_url=f"screenshots/{result.flow_id}.png" if result.screenshot_path else None,
+            ),
+        )
 
         logger.info("PHASE=HEALING")
+        live_events.emit("phase", phase="HEALING")
         healer_verdicts, execution_results = self._heal(
             generated_tests, execution_results, plan, credentials, escalations
         )
 
         logger.info("PHASE=REPORTING")
+        live_events.emit("phase", phase="REPORTING")
         report = self._report(plan, execution_results, healer_verdicts, site_model, prd_text, verdict, escalations)
 
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,6 +107,10 @@ class TestOrchestrator:
             report, REPORTS_DIR, plan=plan, execution_results=execution_results, site_model=site_model
         )
         logger.info("Report written to %s, %s, and %s", json_path, md_path, html_path)
+        live_events.emit(
+            "run_finished", pass_count=report.pass_count, fail_count=report.fail_count,
+            flows_planned=report.flows_planned, escalations=report.escalations,
+        )
 
         return report
 
@@ -105,6 +129,7 @@ class TestOrchestrator:
 
         while True:
             logger.info("PHASE=PLANNING iteration=%d", iteration)
+            live_events.emit("phase", phase="PLANNING", iteration=iteration)
             try:
                 plan = self.planner.plan(
                     site_model, prd_text, focus_hint,
@@ -113,17 +138,30 @@ class TestOrchestrator:
             except SchemaValidationError as exc:
                 logger.error("Planner escalation: %s", exc)
                 escalations.append(f"Planner failed to produce a valid plan: {exc}")
+                live_events.emit("escalation", stage="planner", detail=str(exc))
                 break
 
+            live_events.emit(
+                "plan_produced", iteration=iteration, flow_count=len(plan.flows),
+                categories=sorted({f.category for f in plan.flows}),
+            )
+
             logger.info("PHASE=CRITIQUE iteration=%d", iteration)
+            live_events.emit("phase", phase="CRITIQUE", iteration=iteration)
             try:
                 verdict = self.critic.review(plan, site_model, max_iterations=self.settings.max_replan_iterations)
             except SchemaValidationError as exc:
                 logger.error("Critic escalation: %s", exc)
                 escalations.append(f"Critic failed to produce a valid verdict: {exc}")
+                live_events.emit("escalation", stage="critic", detail=str(exc))
                 break
 
             logger.info("Critic decision=%s overall_score=%.2f", verdict.decision, verdict.overall_score)
+            live_events.emit(
+                "critic_verdict", iteration=iteration, decision=verdict.decision,
+                overall_score=verdict.overall_score, gaps=verdict.gaps,
+                dimension_scores=verdict.dimension_scores,
+            )
 
             if verdict.decision == "proceed":
                 break
@@ -149,10 +187,24 @@ class TestOrchestrator:
         generated_tests: list[GeneratedTest] = []
         for flow in ordered_flows:
             try:
-                generated_tests.append(self.generator.generate(flow, credentials=credentials))
+                gt = self.generator.generate(flow, credentials=credentials)
+                generated_tests.append(gt)
+                live_events.emit(
+                    "test_generated", flow_id=gt.flow_id, category=flow.category,
+                    title=flow.title, validation_status=gt.validation_status,
+                    file_path=gt.file_path, command=f"pytest {gt.file_path} -q",
+                    steps=[
+                        {
+                            "action": s.action, "target_description": s.target_description,
+                            "value": s.value, "expected_outcome": s.expected_outcome,
+                        }
+                        for s in flow.steps
+                    ],
+                )
             except SchemaValidationError as exc:
                 logger.error("Generator escalation for flow %s: %s", flow.flow_id, exc)
                 escalations.append(f"Generator failed for flow {flow.flow_id}: {exc}")
+                live_events.emit("escalation", stage="generator", flow_id=flow.flow_id, detail=str(exc))
         return generated_tests
 
     def _heal(self, generated_tests, execution_results, plan, credentials, escalations: list[str]):
@@ -168,6 +220,7 @@ class TestOrchestrator:
             except SchemaValidationError as exc:
                 logger.error("Healer escalation for flow %s: %s", result.flow_id, exc)
                 escalations.append(f"Healer failed for flow {result.flow_id}: {exc}")
+                live_events.emit("escalation", stage="healer", flow_id=result.flow_id, detail=str(exc))
                 continue
 
             if verdict is None:
@@ -176,6 +229,10 @@ class TestOrchestrator:
             logger.info(
                 "Healer flow=%s classification=%s action=%s",
                 verdict.flow_id, verdict.classification, verdict.action_taken,
+            )
+            live_events.emit(
+                "healer_verdict", flow_id=verdict.flow_id, classification=verdict.classification,
+                confidence=verdict.confidence, action_taken=verdict.action_taken, rationale=verdict.rationale,
             )
 
             if verdict.action_taken == "auto_repaired":

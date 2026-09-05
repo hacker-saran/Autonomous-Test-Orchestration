@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, TypeVar
 
 from openai import OpenAI
@@ -46,6 +47,13 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _MAX_VALIDATION_ATTEMPTS = 2
+# Transient provider-side hiccups (a 400/5xx that clears up moments later on
+# the exact same key/model — auth-layer propagation delays, brief infra
+# blips) get one same-model retry with a short backoff before we give up on
+# that model. The openai SDK's own retry only covers 429/5xx; it does not
+# retry 400s, which is exactly the error shape seen here.
+_MAX_API_ATTEMPTS_PER_MODEL = 2
+_API_RETRY_BACKOFF_S = 2.0
 
 
 class SchemaValidationError(Exception):
@@ -89,6 +97,30 @@ def _build_tool(response_model: type[BaseModel]) -> dict[str, Any]:
     }
 
 
+def _coerce_stringified_json(value: Any) -> Any:
+    """Some function-calling gateways/proxies (seen live: an OpenRouter-backed
+    model via a TrueFoundry gateway) occasionally emit a nested object or
+    array as a JSON-encoded *string* inside a tool call's arguments instead
+    of a native structure — e.g. `{"flows": ["{\\"id\\": ...}", ...]}` instead
+    of `{"flows": [{"id": ...}, ...]}`. Recursively re-parse any string that
+    looks like embedded JSON so Pydantic validation sees real nested objects
+    rather than failing with "should be a valid dictionary".
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in "{[":
+            try:
+                return _coerce_stringified_json(json.loads(stripped))
+            except json.JSONDecodeError:
+                return value
+        return value
+    if isinstance(value, list):
+        return [_coerce_stringified_json(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_stringified_json(v) for k, v in value.items()}
+    return value
+
+
 def _call_with_validation_retry(
     client: OpenAI,
     model_name: str,
@@ -125,7 +157,7 @@ def _call_with_validation_retry(
 
         call = tool_calls[0]
         try:
-            parsed = json.loads(call.function.arguments)
+            parsed = _coerce_stringified_json(json.loads(call.function.arguments))
             return response_model.model_validate(parsed)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = str(exc)
@@ -188,16 +220,23 @@ def call_structured(
 
     last_api_error: Exception | None = None
     for model_name in models_to_try:
-        try:
-            return _call_with_validation_retry(
-                client, model_name, system_prompt, user_prompt, tool, tool_name, response_model
-            )
-        except SchemaValidationError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any SDK/network error triggers fallback
-            logger.warning("call_structured: model %s errored, trying fallback: %s", model_name, exc)
-            last_api_error = exc
-            continue
+        for attempt in range(1, _MAX_API_ATTEMPTS_PER_MODEL + 1):
+            try:
+                return _call_with_validation_retry(
+                    client, model_name, system_prompt, user_prompt, tool, tool_name, response_model
+                )
+            except SchemaValidationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any SDK/network error triggers retry/fallback
+                last_api_error = exc
+                if attempt < _MAX_API_ATTEMPTS_PER_MODEL:
+                    logger.warning(
+                        "call_structured: model %s errored (attempt %d/%d), retrying in %.1fs: %s",
+                        model_name, attempt, _MAX_API_ATTEMPTS_PER_MODEL, _API_RETRY_BACKOFF_S, exc,
+                    )
+                    time.sleep(_API_RETRY_BACKOFF_S)
+                else:
+                    logger.warning("call_structured: model %s errored, trying fallback: %s", model_name, exc)
 
     raise SchemaValidationError(
         f"All models {models_to_try} failed for {response_model.__name__}: {last_api_error}"

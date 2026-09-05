@@ -15,11 +15,13 @@ env/
 .env
 .env.local
 creds*.json
-credentials*.json
+credential*.json
 
 # Pipeline runtime output
 orchestrator/generated_tests/
 orchestrator/reports/
+dashboard/events.jsonl
+dashboard/screenshots/
 
 # Test / tool caches
 .pytest_cache/

@@ -74,7 +74,13 @@ Rules:
   6. If `feedback` (gaps from a previous Critic review) is given, this is a
      re-plan: your new plan must directly address every listed gap.
   7. Every other flow's `source` defaults to "crawl".
-  8. Produce the whole plan in this one response — do not ask for more calls.
+  8. Every flow's first step must be a `navigate` action with `value` set to an
+     absolute URL actually present in the SiteModel (`start_url` or one of the
+     crawled page URLs) — never leave a `navigate` step's `value` empty, even
+     when the flow starts on the same page the crawl began on. The Generator
+     resolves `navigate` purely from `value`, not from `target_description`,
+     so an empty `value` makes the entire flow silently unresolvable.
+  9. Produce the whole plan in this one response — do not ask for more calls.
 """
 
 
