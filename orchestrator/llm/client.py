@@ -19,17 +19,24 @@ mode (never prompt-and-hope JSON, and no dependency on tool-calling support):
   3. On a validation error, the reply is appended to the conversation along
      with the error text, and the call is retried once more (max 2 attempts
      total against one model).
-  4. If the primary model errors or is unavailable, the call is retried
-     against LLM_MODEL_FALLBACK.
-  5. If every attempt fails, a `SchemaValidationError` is raised. Callers
-     (the orchestrator) must catch this and record it as an escalation — it
-     must never crash the pipeline.
+  4. Each model gets up to `_MAX_API_ATTEMPTS_PER_MODEL` attempts with a short
+     backoff for a transient SDK/network error (a 400/5xx that clears up
+     moments later on the exact same key/model — the openai SDK's own retry
+     only covers 429/5xx) before falling back to LLM_MODEL_FALLBACK.
+  5. If every attempt on every model fails, a `SchemaValidationError` is
+     raised. Callers (the orchestrator) must catch this and record it as an
+     escalation — it must never crash the pipeline.
 
 We deliberately avoid tool calling here: some OpenAI-compatible providers
 (e.g. Sarvam) don't reliably honor a forced `tool_choice`, or mis-serialize
 nested objects/arrays inside tool-call arguments. `response_format` json_schema
 mode asks the provider to constrain its own text generation to the schema
-directly, which every provider we've targeted supports more reliably.
+directly, which every provider we've targeted supports more reliably. As
+cheap extra insurance, `_coerce_stringified_json` still recursively re-parses
+any value that looks like JSON encoded as a string, in case a provider/gateway
+does that even outside tool-calling (seen live on an OpenRouter-backed model
+behind a TrueFoundry gateway, under the older tool-calling design this
+replaced).
 
 Note: reasoning models return chain-of-thought in a separate
 `reasoning_content` field on the message, not `content`. This wrapper never
@@ -42,6 +49,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, TypeVar
 
 from openai import OpenAI
@@ -55,6 +63,13 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _MAX_VALIDATION_ATTEMPTS = 2
 _MAX_TOKENS = 16384
+# Transient provider-side hiccups (a 400/5xx that clears up moments later on
+# the exact same key/model — auth-layer propagation delays, brief infra
+# blips) get one same-model retry with a short backoff before we give up on
+# that model. The openai SDK's own retry only covers 429/5xx; it does not
+# retry 400s, which is exactly the error shape seen here.
+_MAX_API_ATTEMPTS_PER_MODEL = 2
+_API_RETRY_BACKOFF_S = 2.0
 
 
 class SchemaValidationError(Exception):
@@ -98,6 +113,30 @@ def _build_response_format(response_model: type[BaseModel]) -> dict[str, Any]:
             "schema": response_model.model_json_schema(),
         },
     }
+
+
+def _coerce_stringified_json(value: Any) -> Any:
+    """Some function-calling gateways/proxies (seen live: an OpenRouter-backed
+    model via a TrueFoundry gateway) occasionally emit a nested object or
+    array as a JSON-encoded *string* inside a tool call's arguments instead
+    of a native structure — e.g. `{"flows": ["{\\"id\\": ...}", ...]}` instead
+    of `{"flows": [{"id": ...}, ...]}`. Recursively re-parse any string that
+    looks like embedded JSON so Pydantic validation sees real nested objects
+    rather than failing with "should be a valid dictionary".
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in "{[":
+            try:
+                return _coerce_stringified_json(json.loads(stripped))
+            except json.JSONDecodeError:
+                return value
+        return value
+    if isinstance(value, list):
+        return [_coerce_stringified_json(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_stringified_json(v) for k, v in value.items()}
+    return value
 
 
 def _call_with_validation_retry(
@@ -155,7 +194,12 @@ def _call_with_validation_retry(
             continue
 
         try:
-            parsed = json.loads(content)
+            # response_format/json_schema mode makes the model generate its own
+            # reply text directly against the schema, so it's much less prone to
+            # the stringified-nested-JSON issue tool-calling gateways can
+            # introduce — but _coerce_stringified_json is cheap insurance in
+            # case some provider/gateway does it here too.
+            parsed = _coerce_stringified_json(json.loads(content))
             return response_model.model_validate(parsed)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = str(exc)
@@ -212,16 +256,23 @@ def call_structured(
 
     last_api_error: Exception | None = None
     for model_name in models_to_try:
-        try:
-            return _call_with_validation_retry(
-                client, model_name, system_prompt, user_prompt, response_format, response_model, extra_body
-            )
-        except SchemaValidationError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any SDK/network error triggers fallback
-            logger.warning("call_structured: model %s errored, trying fallback: %s", model_name, exc)
-            last_api_error = exc
-            continue
+        for attempt in range(1, _MAX_API_ATTEMPTS_PER_MODEL + 1):
+            try:
+                return _call_with_validation_retry(
+                    client, model_name, system_prompt, user_prompt, response_format, response_model, extra_body
+                )
+            except SchemaValidationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any SDK/network error triggers retry/fallback
+                last_api_error = exc
+                if attempt < _MAX_API_ATTEMPTS_PER_MODEL:
+                    logger.warning(
+                        "call_structured: model %s errored (attempt %d/%d), retrying in %.1fs: %s",
+                        model_name, attempt, _MAX_API_ATTEMPTS_PER_MODEL, _API_RETRY_BACKOFF_S, exc,
+                    )
+                    time.sleep(_API_RETRY_BACKOFF_S)
+                else:
+                    logger.warning("call_structured: model %s errored, trying fallback: %s", model_name, exc)
 
     raise SchemaValidationError(
         f"All models {models_to_try} failed for {response_model.__name__}: {last_api_error}"
