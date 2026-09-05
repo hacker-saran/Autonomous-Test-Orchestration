@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { Header } from "./components/Header";
 import { KpiRow } from "./components/KpiRow";
 import { PhaseStepper } from "./components/PhaseStepper";
@@ -9,6 +9,7 @@ import { PlanSummaryPanel } from "./components/PlanSummaryPanel";
 import { ExecutionSummaryPanel } from "./components/ExecutionSummaryPanel";
 import { HealerSummaryPanel } from "./components/HealerSummaryPanel";
 import { NewRunForm } from "./components/NewRunForm";
+import { ReportsModal } from "./components/ReportsModal";
 import { useEventSocket, type ConnectionStatus } from "./hooks/useEventSocket";
 import { useRunDispatch } from "./state/RunContext";
 import type { PipelineEvent } from "./types/events";
@@ -17,6 +18,7 @@ const WS_URL = `${window.location.protocol === "https:" ? "wss" : "ws"}://${wind
 
 function Dashboard() {
   const dispatch = useRunDispatch();
+  const [reportsOpen, setReportsOpen] = useState(false);
 
   const onEvent = useCallback((event: PipelineEvent) => dispatch({ kind: "event", event }), [dispatch]);
   const onStatus = useCallback(
@@ -27,7 +29,8 @@ function Dashboard() {
 
   return (
     <>
-      <Header />
+      <Header onOpenReports={() => setReportsOpen(true)} />
+      {reportsOpen ? <ReportsModal onClose={() => setReportsOpen(false)} /> : null}
       <KpiRow />
       <PhaseStepper />
       <main className="grid h-[calc(100vh-165px)] grid-cols-[1fr_440px] gap-4 px-7 pt-4 pb-6">

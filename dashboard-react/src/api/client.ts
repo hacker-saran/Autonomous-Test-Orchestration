@@ -1,3 +1,5 @@
+import type { FinalReport } from "../types/report";
+
 export interface RunSummary {
   run_id: string;
   url: string;
@@ -54,7 +56,7 @@ export function getCurrentRun(): Promise<RunSummary | null> {
 
 export interface ReportListEntry {
   timestamp: string;
-  report: Record<string, unknown>;
+  report: FinalReport;
 }
 
 export function listReports(): Promise<ReportListEntry[]> {
