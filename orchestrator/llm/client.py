@@ -1,0 +1,189 @@
+"""Sarvam AI client wrapper.
+
+Sarvam's API is OpenAI-compatible, so we use the `openai` SDK pointed at their
+endpoint instead of hand-rolled HTTP. Every agent that needs a structured LLM
+output goes through `call_structured()` below — no agent talks to the Sarvam
+API directly.
+
+Every structured output is forced through a single-tool call (never
+prompt-and-hope JSON):
+  1. One tool is defined from the target Pydantic model's JSON schema.
+  2. The call forces that tool via `tool_choice`.
+  3. The returned tool-call arguments are parsed as JSON and validated against
+     the Pydantic model.
+  4. On a validation error, the error text is appended to the conversation and
+     the call is retried once more (max 2 attempts total against one model).
+  5. If the primary model errors or is unavailable, the call is retried
+     against SARVAM_MODEL_FALLBACK.
+  6. If every attempt fails, a `SchemaValidationError` is raised. Callers
+     (the orchestrator) must catch this and record it as an escalation — it
+     must never crash the pipeline.
+
+Note: reasoning models return chain-of-thought in a separate
+`reasoning_content` field on the message, not `content`. This wrapper never
+reads or surfaces that field. If a rationale is needed downstream (e.g. in the
+final report), it must be an explicit field on the response model
+(e.g. `HealerVerdict.rationale`) that the model fills in as part of its
+structured tool call.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, TypeVar
+
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+from orchestrator.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+_MAX_VALIDATION_ATTEMPTS = 2
+
+
+class SchemaValidationError(Exception):
+    """Raised when a response_model could not be produced after all retries
+    and model fallbacks. Callers must catch this and treat it as an
+    escalation, never let it crash the pipeline.
+    """
+
+
+def _client() -> OpenAI:
+    settings = get_settings()
+    return OpenAI(
+        base_url=settings.sarvam_base_url,
+        api_key=settings.sarvam_api_key,
+        default_headers={"api-subscription-key": settings.sarvam_api_key},
+    )
+
+
+def _tool_name_for(response_model: type[BaseModel]) -> str:
+    return f"emit_{response_model.__name__.lower()}"
+
+
+def _build_tool(response_model: type[BaseModel]) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _tool_name_for(response_model),
+            "description": f"Emit a validated {response_model.__name__} payload.",
+            "parameters": response_model.model_json_schema(),
+        },
+    }
+
+
+def _call_with_validation_retry(
+    client: OpenAI,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    tool: dict[str, Any],
+    tool_name: str,
+    response_model: type[ModelT],
+) -> ModelT:
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    last_error: str | None = None
+
+    for attempt in range(1, _MAX_VALIDATION_ATTEMPTS + 1):
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=[tool],
+            tool_choice={"type": "function", "function": {"name": tool_name}},
+        )
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+
+        if not tool_calls:
+            last_error = "model returned no tool call"
+            logger.warning(
+                "call_structured: %s attempt %d/%d on %s: %s",
+                response_model.__name__, attempt, _MAX_VALIDATION_ATTEMPTS, model_name, last_error,
+            )
+            messages.append({"role": "user", "content": f"You must call the {tool_name} tool. Retry."})
+            continue
+
+        call = tool_calls[0]
+        try:
+            parsed = json.loads(call.function.arguments)
+            return response_model.model_validate(parsed)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            last_error = str(exc)
+            logger.warning(
+                "call_structured: %s attempt %d/%d on %s failed validation: %s",
+                response_model.__name__, attempt, _MAX_VALIDATION_ATTEMPTS, model_name, last_error,
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.function.name, "arguments": call.function.arguments},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": f"Validation error, fix your arguments and retry: {exc}",
+                }
+            )
+
+    raise SchemaValidationError(
+        f"{response_model.__name__} validation failed after {_MAX_VALIDATION_ATTEMPTS} attempts "
+        f"on model {model_name}: {last_error}"
+    )
+
+
+def call_structured(
+    system_prompt: str,
+    user_prompt: str,
+    response_model: type[ModelT],
+    model: str | None = None,
+) -> ModelT:
+    """Call Sarvam, forcing a single tool call shaped like `response_model`,
+    validate the result, and return an instance of `response_model`.
+
+    Tries `model` (or SARVAM_MODEL_PRIMARY if unset) first; if that model
+    errors or is unavailable, retries against SARVAM_MODEL_FALLBACK. Schema
+    validation failures on a given model are retried in-place (see
+    `_call_with_validation_retry`) and are NOT treated as a reason to fall
+    back to a different model.
+    """
+    settings = get_settings()
+    primary = model or settings.sarvam_model_primary
+    models_to_try = [primary]
+    if settings.sarvam_model_fallback != primary:
+        models_to_try.append(settings.sarvam_model_fallback)
+
+    tool = _build_tool(response_model)
+    tool_name = _tool_name_for(response_model)
+    client = _client()
+
+    last_api_error: Exception | None = None
+    for model_name in models_to_try:
+        try:
+            return _call_with_validation_retry(
+                client, model_name, system_prompt, user_prompt, tool, tool_name, response_model
+            )
+        except SchemaValidationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any SDK/network error triggers fallback
+            logger.warning("call_structured: model %s errored, trying fallback: %s", model_name, exc)
+            last_api_error = exc
+            continue
+
+    raise SchemaValidationError(
+        f"All models {models_to_try} failed for {response_model.__name__}: {last_api_error}"
+    )

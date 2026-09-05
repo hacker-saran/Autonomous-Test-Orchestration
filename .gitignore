@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+
+# Pipeline runtime output
+orchestrator/generated_tests/
+orchestrator/reports/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Playwright
+test-results/
+playwright-report/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
